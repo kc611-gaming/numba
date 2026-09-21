@@ -450,6 +450,100 @@ class TestArrayReductions(MemoryLeakMixin, TestCase):
     def test_sum_basic(self):
         self.check_reduction_basic(array_sum)
 
+    def test_sum_integer_accumulator_dtype(self):
+        # The ArrayIterator-based implementation regressed NumPy's
+        # accumulator promotion for unsigned inputs narrower than intp,
+        # accumulating (and returning) them as signed intp instead of uintp.
+        cases = [
+            (np.int8, types.intp),
+            (np.int16, types.intp),
+            (np.int32, types.intp),
+            (np.int64, types.int64),
+            (np.uint8, types.uintp),
+            (np.uint16, types.uintp),
+            (np.uint32, types.uintp),
+            (np.uint64, types.uint64),
+            (np.bool_, types.intp),
+        ]
+
+        @njit
+        def sum_no_axis(a):
+            return a.sum()
+
+        @njit
+        def sum_axis(a):
+            return np.sum(a, axis=0)
+
+        for np_dtype, nb_dtype in cases:
+            arr = np.ones((2, 3), dtype=np_dtype)
+            with self.subTest(np_dtype=np_dtype):
+                sum_no_axis(arr)
+                self.assertEqual(
+                    sum_no_axis.nopython_signatures[-1].return_type,
+                    nb_dtype)
+                sum_axis(arr)
+                self.assertEqual(
+                    sum_axis.nopython_signatures[-1].return_type,
+                    types.Array(nb_dtype, 1, 'C'))
+
+    def test_sum_integer_memory_order_layouts(self):
+        # The no-axis integer sum must be correct for arbitrary layouts,
+        # including negative strides, unaligned buffers and empty arrays.
+        integer_dtypes = (np.int8, np.uint8, np.int16, np.uint16,
+                          np.int32, np.uint32, np.int64, np.uint64,
+                          np.bool_)
+
+        @njit
+        def sum_global(a):
+            return np.sum(a)
+
+        @njit
+        def sum_method(a):
+            return a.sum()
+
+        for dtype in integer_dtypes:
+            if dtype == np.bool_:
+                vals = [False, True, True, False, True]
+                base = np.resize(np.array(vals, dtype=dtype), (3, 4, 5))
+            else:
+                base = np.arange(60, dtype=dtype).reshape(3, 4, 5)
+            buf = np.empty(base.nbytes + 1, dtype=np.uint8)
+            unaligned = np.ndarray(base.shape, dtype=dtype, buffer=buf,
+                                   offset=1)
+            unaligned[...] = base
+            arrays = [
+                base, np.asfortranarray(base), base.transpose(2, 0, 1),
+                base[::-1, ::-1, ::-1], base[::2, ::-2, ::2],
+                np.array(base[0, 0, 0]), base[:0], base[:, :0],
+                unaligned.transpose(2, 0, 1),
+            ]
+            for arr in arrays:
+                before = arr.copy()
+                expected = int(np.sum(arr))
+                for func in (sum_global, sum_method):
+                    with self.subTest(dtype=dtype, shape=arr.shape,
+                                      strides=arr.strides):
+                        self.assertEqual(int(func(arr)), expected)
+                np.testing.assert_array_equal(arr, before)
+
+        # Explicit narrower accumulator must wrap around like NumPy.
+        @njit
+        def sum_i8(a):
+            return np.sum(a, dtype=np.int8)
+
+        arr = np.full((2, 3), 100, dtype=np.int16).T
+        self.assertEqual(sum_i8(arr), np.sum(arr, dtype=np.int8))
+
+        # Rank greater than 4 must use the memory-order path too.
+        for shape in ((4, 3, 2, 5, 3), (3, 2, 2, 2, 3, 4)):
+            base = np.arange(np.prod(shape), dtype=np.int64).reshape(shape)
+            axes = list(range(len(shape)))[::-1]
+            for arr in (base.swapaxes(0, 1), base.transpose(axes)):
+                expected = int(np.sum(arr))
+                with self.subTest(shape=shape, strides=arr.strides):
+                    self.assertEqual(int(sum_global(arr)), expected)
+                    self.assertEqual(int(sum_method(arr)), expected)
+
     def test_mean_basic(self):
         self.check_reduction_basic(array_mean)
 
