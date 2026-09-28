@@ -1,0 +1,37 @@
+import llvmlite.binding as llb
+llb.initialize_all_targets()
+llb.initialize_all_asmprinters()
+
+variants = ["_ZGVdN4v_exp"]
+ir = f"""
+define void @foo(double* %in, double* %out, i64 %n) {{
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [0, %entry], [%i.next, %loop]
+  %p = getelementptr double, double* %in, i64 %i
+  %v = load double, double* %p
+  %r = call fast double @exp(double %v)
+  %po = getelementptr double, double* %out, i64 %i
+  store double %r, double* %po
+  %i.next = add i64 %i, 1
+  %c = icmp slt i64 %i.next, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}}
+declare double @exp(double) readnone nounwind willreturn "vector-function-abi-variant"="{','.join(f'{v}(exp)' for v in variants)}"
+"""
+mod = llb.parse_assembly(ir)
+t = llb.Target.from_triple(llb.get_process_triple())
+feats = llb.get_host_cpu_features()
+fstr = ','.join(('+' + k) if v else ('-' + k) for k, v in feats.items())
+tm = t.create_target_machine(cpu='skylake-avx512', features='+avx512f,+avx2,+fma,+avx512dq', opt=2)
+pmb = llb.create_pass_builder(tm, llb.create_pipeline_tuning_options(speed_level=2))
+pm = pmb.getModulePassManager()
+pm.run(mod, pmb)
+asm = tm.emit_assembly(mod)
+print("has _ZGV:", '_ZGV' in asm)
+for l in asm.splitlines():
+    if 'call' in l and ('exp' in l or 'ZGV' in l):
+        print(l.strip())

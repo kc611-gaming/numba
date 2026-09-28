@@ -1,0 +1,32 @@
+480a481,505
+> 
+> def _flat_1d_fastpath(context, builder, sig, args, ufunc, kernel, inputs, outputs, loopshape):
+>     """Flat unit-stride element loop for unary ufuncs over 1d contiguous
+>     arrays.  Index-based addressing lets the LLVM loop vectorizer
+>     vectorize the loop, including mapped vector math calls.
+>     """
+>     if ufunc.nin != 1 or ufunc.nout != 1:
+>         return None
+>     inp = inputs[0]
+>     out = outputs[0]
+>     if not isinstance(inp, _ArrayHelper) or not isinstance(out, _ArrayHelper):
+>         return None
+>     if inp.ndim != 1 or out.ndim != 1:
+>         return None
+>     if inp.layout not in 'CF' or out.layout not in 'CF':
+>         return None
+>     intpty = context.get_value_type(types.intp)
+>     n = loopshape[0]
+>     with cgutils.for_range(builder, n, intp=intpty) as loop:
+>         i = loop.index
+>         v = kernel.generate(inp.load_data([i]))
+>         out.store_data([i], v)
+>     res = impl_ret_new_ref(context, builder, sig.return_type, out.return_val)
+>     return res
+> 
+530a556,560
+> 
+>     _fastpath_ret = _flat_1d_fastpath(context, builder, sig, args, ufunc,
+>                                       kernel, inputs, outputs, loopshape)
+>     if _fastpath_ret is not None:
+>         return _fastpath_ret
