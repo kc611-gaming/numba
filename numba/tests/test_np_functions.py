@@ -7100,6 +7100,32 @@ class TestNPFunctions(MemoryLeakMixin, TestCase):
         yield np.array([5]), np.array([2])
         yield np.array([True, False]), np.array([False, False, False])
 
+        # Cases that exercise the lookup-table fast path: sufficiently many
+        # test elements relative to the first array and a small value range.
+        yield (np.array([1, 5, 5, 9, 100] * 40, dtype=np.int64),
+               np.array([5, 9, 200, -7] * 40, dtype=np.int64))
+        yield (np.array([0, 1, 2, 3] * 50, dtype=np.uint16),
+               np.array([1, 2, 9] * 50, dtype=np.uint16))
+        yield (np.array([-3, -2, -1, 0] * 50, dtype=np.int8),
+               np.array([-2, 0, 5] * 50, dtype=np.int8))
+        yield (np.array([True, False] * 100),
+               np.array([True, False] * 100))
+        # Unique inputs so that assume_unique=True is exercised on table path
+        yield (np.arange(200, dtype=np.int64),
+               np.arange(0, 300, 2, dtype=np.int64))
+        yield (np.arange(150, dtype=np.uint32),
+               np.arange(140, 160, dtype=np.uint32))
+        # Narrow range at a large negative magnitude (int64 offset handling)
+        yield (np.int64(-2 ** 62) + np.arange(200, dtype=np.int64),
+               np.int64(-2 ** 62) + np.arange(0, 300, 3, dtype=np.int64))
+        # Unsigned values straddling the int64 sign boundary
+        base = np.uint64(2 ** 63)
+        yield (base + np.arange(200, dtype=np.uint64),
+               base + np.arange(0, 300, 3, dtype=np.uint64))
+        # Huge unsigned range must fall back to the generic sort path
+        yield (np.arange(200, dtype=np.uint64) * np.uint64(2 ** 40),
+               np.arange(0, 300, 3, dtype=np.uint64) * np.uint64(2 ** 40))
+
         for dtype1, dtype2 in [
             (np.int8, np.int16),
             (np.int16, np.int8),

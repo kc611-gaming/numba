@@ -5661,7 +5661,7 @@ def jit_np_setxor1d(ar1, ar2, assume_unique=False):
 # Internal helper for in1d functionality, used by isin and setdiff1d
 # This is needed because np.in1d was removed in NumPy 2.4
 @register_jitable
-def _in1d_impl(ar1, ar2, assume_unique=False, invert=False):
+def _in1d_generic(ar1, ar2, assume_unique=False, invert=False):
     # https://github.com/numpy/numpy/blob/03b62604eead0f7d279a5a4c094743eb29647368/numpy/lib/arraysetops.py#L525 # noqa: E501
 
     # Ravel both arrays, behavior for the first array could be different
@@ -5669,8 +5669,6 @@ def _in1d_impl(ar1, ar2, assume_unique=False, invert=False):
     ar2 = np.asarray(ar2).ravel()
 
     # This code is run when it would make the code significantly faster
-    # Sorting is also not guaranteed to work on objects but numba does
-    # not support object arrays.
     if len(ar2) < 10 * len(ar1) ** 0.145:
         if invert:
             mask = np.ones(len(ar1), dtype=np.bool_)
@@ -5682,41 +5680,158 @@ def _in1d_impl(ar1, ar2, assume_unique=False, invert=False):
                 mask |= (ar1 == a)
         return mask
 
-    # Otherwise use sorting
-    if not assume_unique:
-        # Equivalent to ar1, inv_idx = np.unique(ar1, return_inverse=True)
-        # https://github.com/numpy/numpy/blob/03b62604eead0f7d279a5a4c094743eb29647368/numpy/lib/arraysetops.py#L358C8-L358C8 # noqa: E501
-        order1 = np.argsort(ar1)
-        aux = ar1[order1]
-        mask = np.empty(aux.shape, dtype=np.bool_)
-        mask[:1] = True
-        mask[1:] = aux[1:] != aux[:-1]
-        ar1 = aux[mask]
-        imask = np.cumsum(mask) - 1
-        inv_idx = np.empty(mask.shape, dtype=np.intp)
-        inv_idx[order1] = imask
-        ar2 = np.unique(ar2)
-
-    ar = np.concatenate((ar1, ar2))
-    # We need this to be a stable sort, so always use 'mergesort'
-    # here. The values from the first array should always come before
-    # the values from the second array.
-    order = ar.argsort(kind='mergesort')
-    sar = ar[order]
-    flag = np.empty(sar.size, np.bool_)
-    if invert:
-        flag[:-1] = (sar[1:] != sar[:-1])
-    else:
-        flag[:-1] = (sar[1:] == sar[:-1])
-    flag[-1:] = invert
-    ret = np.empty(ar.shape, dtype=np.bool_)
-    ret[order] = flag
-
-    # return ret[:len(ar1)]
+    # Sort ar1 and, unless the caller guarantees uniqueness, reduce it to
+    # unique values while keeping an inverse index to map the answer back to
+    # the original element order.
+    order1 = np.argsort(ar1)
+    u1 = ar1[order1]
+    n = u1.size
+    inv_idx = np.empty(n, dtype=np.intp)
     if assume_unique:
-        return ret[:len(ar1)]
+        inv_idx[order1] = np.arange(n)
     else:
-        return ret[inv_idx]
+        # Equivalent to ar1, inv_idx = np.unique(ar1, return_inverse=True)
+        mask = np.empty(n, dtype=np.bool_)
+        mask[:1] = True
+        mask[1:] = u1[1:] != u1[:-1]
+        u1 = u1[mask]
+        imask = np.cumsum(mask) - 1
+        inv_idx[order1] = imask
+
+    u2 = np.unique(ar2)
+
+    # u1 and u2 are both sorted ascending, so a single two-pointer pass gives
+    # the membership of every unique value in u1. This does linear work where
+    # NumPy concatenates the arrays and runs a stable mergesort over both.
+    mem = np.zeros(u1.size, dtype=np.bool_)
+    j = 0
+    for i in range(u1.size):
+        v = u1[i]
+        while j < u2.size and u2[j] < v:
+            j += 1
+        if j < u2.size and u2[j] == v:
+            mem[i] = True
+
+    res = mem[inv_idx]
+    if invert:
+        res = ~res
+    return res
+
+
+# Compile-time classification of an array dtype for the lookup-table fast path.
+def _in1d_table_kind(dtype):
+    # Returns 'signed', 'unsigned' or None. Bool is handled as signed int.
+    if isinstance(dtype, types.Boolean):
+        return 'signed'
+    if isinstance(dtype, types.Integer):
+        return 'signed' if dtype.signed else 'unsigned'
+    return None
+
+
+# Lookup-table method (same idea as NumPy's kind='table'): membership of the
+# first array is answered by a boolean table indexed by value - min(value).
+# Restricted to integer/bool dtypes, and only used when the value range (and
+# hence the table) is small enough. Falls back to the generic algorithm for
+# tiny test sets, degenerate inputs, huge ranges or mixed dtypes.
+@register_jitable
+def _in1d_table_signed(ar1, ar2, assume_unique=False, invert=False):
+    a = np.asarray(ar1).ravel()
+    b = np.asarray(ar2).ravel()
+    n = a.size
+    m = b.size
+
+    # Tiny test sets are faster with the broadcast method and avoid the
+    # empty-input edge cases of the table method.
+    if n == 0 or m == 0 or m < 10 * n ** 0.145:
+        return _in1d_generic(ar1, ar2, assume_unique, invert)
+
+    # int64 arithmetic is modular, so decoding unsigned values that cross the
+    # sign boundary stays consistent as long as the true range fits in int64
+    # (checked below via rng < 0).
+    mn = np.int64(b[0])
+    mx = mn
+    for i in range(1, m):
+        v = np.int64(b[i])
+        if v < mn:
+            mn = v
+        elif v > mx:
+            mx = v
+
+    rng = mx - mn
+    if rng < 0 or rng > 6 * (n + m):
+        return _in1d_generic(ar1, ar2, assume_unique, invert)
+
+    table = np.zeros(rng + 1, dtype=np.bool_)
+    for i in range(m):
+        table[np.int64(b[i]) - mn] = True
+
+    out = np.empty(n, dtype=np.bool_)
+    for i in range(n):
+        v = np.int64(a[i])
+        if v < mn or v > mx:
+            out[i] = invert
+        else:
+            out[i] = table[v - mn] != invert
+    return out
+
+
+@register_jitable
+def _in1d_table_unsigned(ar1, ar2, assume_unique=False, invert=False):
+    a = np.asarray(ar1).ravel()
+    b = np.asarray(ar2).ravel()
+    n = a.size
+    m = b.size
+
+    if n == 0 or m == 0 or m < 10 * n ** 0.145:
+        return _in1d_generic(ar1, ar2, assume_unique, invert)
+
+    mn = np.uint64(b[0])
+    mx = mn
+    for i in range(1, m):
+        v = np.uint64(b[i])
+        if v < mn:
+            mn = v
+        elif v > mx:
+            mx = v
+
+    rng = mx - mn
+    if rng > np.uint64(6 * (n + m)):
+        return _in1d_generic(ar1, ar2, assume_unique, invert)
+
+    table = np.zeros(np.int64(rng) + 1, dtype=np.bool_)
+    for i in range(m):
+        table[np.int64(np.uint64(b[i]) - mn)] = True
+
+    out = np.empty(n, dtype=np.bool_)
+    for i in range(n):
+        v = np.uint64(a[i])
+        if v < mn or v > mx:
+            out[i] = invert
+        else:
+            out[i] = table[np.int64(v - mn)] != invert
+    return out
+
+
+def _in1d_impl(ar1, ar2, assume_unique=False, invert=False):
+    # Implemented through the overload below; the body is never executed.
+    pass
+
+
+@overload(_in1d_impl)
+def _in1d_impl_dispatch(ar1, ar2, assume_unique=False, invert=False):
+    kind = _in1d_table_kind(getattr(ar1, 'dtype', None))
+    kind2 = _in1d_table_kind(getattr(ar2, 'dtype', None))
+    if kind is not None and kind == kind2:
+        table_impl = (_in1d_table_signed if kind == 'signed'
+                      else _in1d_table_unsigned)
+
+        def impl(ar1, ar2, assume_unique=False, invert=False):
+            return table_impl(ar1, ar2, assume_unique, invert)
+    else:
+        def impl(ar1, ar2, assume_unique=False, invert=False):
+            return _in1d_generic(ar1, ar2, assume_unique, invert)
+
+    return impl
 
 
 @overload(np.setdiff1d)
